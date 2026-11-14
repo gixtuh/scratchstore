@@ -1,4 +1,3 @@
-""" Run pip install -r requirements.txt """
 from __future__ import annotations
 
 import base64
