@@ -2,7 +2,7 @@
 
 **ScratchStore (inspired by the word "data store") is a cloud data store/database engine which lets you write anything into a data store file using Python and Scratch with the power of cloud variables.**
 
-![PyPI Python Version](https://img.shields.io/pypi/pyversions/scratchstore)
+[![PyPI Python Version](https://img.shields.io/pypi/pyversions/scratchstore)](https://pypi.org/project/scratchstore/)
 
 
 ## Installation
