@@ -2,7 +2,7 @@
 
 **ScratchStore (inspired by [scratchattach](https://github.com/TimMcCool/scratchattach)) is a cloud data store/database engine which lets you write anything into a data store file using Python and Scratch with the power of cloud variables.**
 
-![icon](./icon.svg)
+![icon](https://raw.githubusercontent.com/gixtuh/scratchstore/refs/heads/main/icon.svg)
 
 [![Static Badge](https://img.shields.io/badge/Python_version-v1.0.3-blue?style=flat-square)](https://pypi.org/project/scratchstore/) ![PyPI Python Version](https://img.shields.io/pypi/pyversions/scratchstore?style=flat-square)
 ![GitHub Downloads (specific asset, all releases)](https://img.shields.io/github/downloads/gixtuh/scratchstore/ScratchStore.Template.sb3?style=flat-square) ![PyPI Downloads](https://img.shields.io/pypi/dm/scratchstore)
