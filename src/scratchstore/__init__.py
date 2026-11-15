@@ -1044,7 +1044,7 @@ _active_server: _Server | None = None
 
 
 def start(verbose: bool = False, automatic: bool = True) -> None:
-    """Start the Scratch server.
+    """Start the ScratchStore connection.
 
     Args:
         verbose: Enable informational server logs when true.
@@ -1081,7 +1081,7 @@ def start(verbose: bool = False, automatic: bool = True) -> None:
 
 
 def stop() -> None:
-    """Stop the active server, if one is running."""
+    """Stop the active connection, if one is running."""
     if _active_server is not None:
         _active_server.stop()
 
