@@ -32,7 +32,7 @@ scratchstore.start(True, True)
 
     - `.connection.use` - Chooses which databases should it include before starting
 
-- `scratchstore.start` - Starts the ScratchStore service
+- `scratchstore.start` - Starts the ScratchStore connection
 
 <hr />
 
