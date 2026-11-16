@@ -266,42 +266,70 @@ class Database:
 
     def _load_or_create(self) -> None:
         self.file.parent.mkdir(parents=True, exist_ok=True)
+
         if not self.file.exists():
             self.data = {}
             self.save()
             return
+
         try:
             raw = json.loads(self.file.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
-            raise ScratchStoreError(f"Database file {self.file} is not valid JSON: {exc}") from exc
+            raise ScratchStoreError(
+                f"Database file {self.file} is not valid JSON: {exc}"
+            ) from exc
+
         if not isinstance(raw, dict):
-            raise ScratchStoreError(f"Database file {self.file} must contain a JSON object.")
-        if isinstance(raw.get("data"), dict):
-            source = raw["data"]
+            raise ScratchStoreError(
+                f"Database file {self.file} must contain a JSON object."
+            )
+
+        # Support and automatically migrate the previous ScratchStore format.
+        legacy_format = raw.get("format") == "scratchstore"
+
+        if legacy_format:
+            source = raw.get("data")
+            if not isinstance(source, dict):
+                raise ScratchStoreError(
+                    f"Legacy database file {self.file} contains invalid data."
+                )
         else:
-            # Accept a simple flat JSON object as an existing database too.
             source = raw
 
         normalized: dict[str, Any] = {}
+
         for key, value in source.items():
             lowered_key = str(key).lower()
+
             if lowered_key in normalized:
                 raise ScratchStoreError(
-                    f"Database file {self.file} contains keys that collide after lowercasing: {lowered_key!r}."
+                    f"Database file {self.file} contains keys that collide "
+                    f"after lowercasing: {lowered_key!r}."
                 )
+
             normalized_value = value.lower() if isinstance(value, str) else value
             normalized[lowered_key] = normalized_value
+
         self.data = normalized
-        if normalized != source:
-            # Persist the migration so older database files stay normalized
-            # even before the next Scratch write occurs.
+
+        # Automatically migrate legacy files and normalize existing keys.
+        if legacy_format or normalized != source:
             self.save()
 
     def save(self) -> None:
         with self._lock:
-            document = {"format": "scratchstore", "version": 1, "name": self.name, "data": self.data}
             temporary = self.file.with_name(self.file.name + ".tmp")
-            temporary.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            temporary.write_text(
+                json.dumps(
+                    self.data,
+                    ensure_ascii=False,
+                    indent=2,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+
             temporary.replace(self.file)
 
     def keys(self) -> list[str]:

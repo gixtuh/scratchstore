@@ -4,7 +4,7 @@
 
 ![icon](https://raw.githubusercontent.com/gixtuh/scratchstore/refs/heads/main/icon.svg)
 
-[![Static Badge](https://img.shields.io/badge/Python_version-v1.1.0-blue?style=flat-square)](https://pypi.org/project/scratchstore/) ![PyPI Python Version](https://img.shields.io/pypi/pyversions/scratchstore?style=flat-square)
+[![Static Badge](https://img.shields.io/badge/Python_version-v1.2.0-blue?style=flat-square)](https://pypi.org/project/scratchstore/) ![PyPI Python Version](https://img.shields.io/pypi/pyversions/scratchstore?style=flat-square)
 ![GitHub Downloads (specific asset, all releases)](https://img.shields.io/github/downloads/gixtuh/scratchstore/ScratchStore.Template.sb3?style=flat-square) ![PyPI Downloads](https://img.shields.io/pypi/dm/scratchstore)
 
 
