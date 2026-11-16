@@ -36,6 +36,8 @@ SEED_MIN = 10_000
 SEED_MAX = 99_999
 FRAME_DATA_LIMIT = 250  # full 250 encoded digits; cloud storage preserves leading zeroes
 RESPONSE_PAGE_LANES = 9
+RESPONSE_PAGE_CHARACTER_CAPACITY = (FRAME_DATA_LIMIT // 2) * RESPONSE_PAGE_LANES
+RESPONSE_PAGE_DELAY_SECONDS = 1.0
 RESPONSE_LANE_NAMES = tuple(f"FH_{i}" for i in range(1, 10))
 REQUEST_VARIABLE = "TH"
 RESERVED = set(":|;\\")
@@ -989,10 +991,13 @@ class _Server:
                         raise AssertionError("A cloud value exceeded Scratch's 256-character limit")
                     values[lane_name] = value
                 self._send_cloud_values(values)
-                # Long responses are streamed page-by-page, with 0.5-second
-                # inter-page spacing to reduce bursts of cloud variable updates.
-                if page_start + RESPONSE_PAGE_LANES < len(chunks):
-                    time.sleep(1)
+                # Nine 250-digit lanes carry 1,125 decoded characters per page.
+                # Wait exactly one second only when another FH_1..FH_9 page
+                # remains to be sent; the final page is not followed by this delay.
+                has_another_page = page_start + RESPONSE_PAGE_LANES < len(chunks)
+                if has_another_page:
+                    assert len(response_text) > RESPONSE_PAGE_CHARACTER_CAPACITY
+                    time.sleep(RESPONSE_PAGE_DELAY_SECONDS)
             # Leave the final response visible briefly before the next queued
             # request overwrites the shared FH variables.
             time.sleep(1)
