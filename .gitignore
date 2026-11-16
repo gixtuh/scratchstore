@@ -2,3 +2,4 @@ dist/
 main.py
 ScratchStore.Template.sb3
 storage.json
+scratchattach.json

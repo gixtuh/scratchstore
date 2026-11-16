@@ -630,7 +630,7 @@ class _Server:
         self._cookie_header = f"scratchsessionsid={session_id};"
         LOG.info("Logged into Scratch as %s", self._authenticated_username)
         LOG.info(
-            "Scratch authentication succeeded",
+            "Scratch authentication succeeded (New Scratcher status: %s)",
             "unknown" if self._new_scratcher is None else self._new_scratcher,
         )
 
