@@ -4,8 +4,12 @@
 
 ![icon](https://raw.githubusercontent.com/gixtuh/scratchstore/refs/heads/main/icon.svg)
 
-[![Static Badge](https://img.shields.io/badge/Python_version-v1.2.1-blue?style=flat-square)](https://pypi.org/project/scratchstore/) ![PyPI Python Version](https://img.shields.io/pypi/pyversions/scratchstore?style=flat-square)
-![GitHub Downloads (specific asset, all releases)](https://img.shields.io/github/downloads/gixtuh/scratchstore/ScratchStore.Template.sb3?style=flat-square) ![PyPI Downloads](https://img.shields.io/pypi/dm/scratchstore)
+![PyPI Version](https://img.shields.io/pypi/v/scratchstore)
+![GitHub repo size](https://img.shields.io/github/repo-size/gixtuh/scratchstore)
+![GitHub commit activity](https://img.shields.io/github/commit-activity/w/gixtuh/scratchstore)
+
+![PyPI Downloads](https://img.shields.io/pypi/dm/scratchstore)
+![PyPI License](https://img.shields.io/pypi/l/scratchstore)
 
 
 
@@ -25,6 +29,9 @@ scratchstore.connection.setup(1439699440, "Policerdarm111", "1234567890") # Not 
 scratchstore.connection.use([file])
 scratchstore.start(True, True)
 ```
+***The documentation about the backend code can be found [here](https://github.com/gixtuh/scratchstore/wiki/Backend)***
+
+***The .sb3 template can be found [here](https://github.com/gixtuh/scratchstore/releases)***
 <hr/>
 
 ### Basic commands:
