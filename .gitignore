@@ -3,3 +3,4 @@ main.py
 ScratchStore.Template.sb3
 storage.json
 scratchattach.json
+src/scratchstore/__pycache__
