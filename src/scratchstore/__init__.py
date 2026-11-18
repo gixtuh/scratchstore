@@ -15,7 +15,7 @@ from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Callable, Iterable
 
-__version__ = "0.3.0"
+__version__ = "1.3.0"
 
 LOG = logging.getLogger("scratchstore")
 
@@ -30,17 +30,29 @@ CODE_TO_CHAR: dict[str, str] = {
     code: char for char, code in CHAR_TO_CODE.items()
 }
 
-CLOUD_VALUE_LIMIT = 256
+SCRATCH_CLOUD_VALUE_LIMIT = 256
+TURBOWARP_CLOUD_VALUE_LIMIT = 100_000
 SEED_LENGTH = 5
 SEED_MIN = 10_000
 SEED_MAX = 99_999
-FRAME_DATA_LIMIT = 250  # full 250 encoded digits; cloud storage preserves leading zeroes
+SCRATCH_FRAME_DATA_LIMIT = 250  # 250 encoded digits per Scratch cloud variable
+SCRATCH_VALUE_LENGTH_LIMIT = 12_000  # Scratch client safeguard; TurboWarp has no total value cap
+TURBOWARP_FRAME_DATA_LIMIT = 99_994  # leaves six digits for the .12345 seed suffix
 RESPONSE_PAGE_LANES = 9
-RESPONSE_PAGE_CHARACTER_CAPACITY = (FRAME_DATA_LIMIT // 2) * RESPONSE_PAGE_LANES
-RESPONSE_PAGE_DELAY_SECONDS = 1.0
+RESPONSE_PAGE_DELAY_SECONDS = 0.6
 RESPONSE_LANE_NAMES = tuple(f"FH_{i}" for i in range(1, 10))
 REQUEST_VARIABLE = "TH"
 RESERVED = set(":|;\\")
+
+SCRATCH_CLOUD_HOST = "wss://clouddata.scratch.mit.edu/"
+TURBOWARP_CLOUD_HOST = "wss://clouddata.turbowarp.org/"
+# TurboWarp blocks bots whose User-Agent lacks contact information, so users
+# should pass connection.setup(..., user_agent="MyBot/1.0 you@example.com").
+DEFAULT_USER_AGENT = f"ScratchStore/{__version__}, made by Policerdarm111 (gixtuh) https://scratch.mit.edu/users/Policerdarm111"
+# TurboWarp replays a room's stored variables right after the handshake, and a
+# brand-new room replays nothing at all, so "skip the first TH packet" would
+# swallow a real request. Instead, ignore TH packets for this long after joining.
+TURBOWARP_SNAPSHOT_GRACE_SECONDS = 2.0
 
 
 class ScratchStoreError(Exception):
@@ -79,6 +91,9 @@ def encode_text(text: str) -> str:
     if len(encoded) % 2:
         raise AssertionError("The encoder produced an odd-length stream.")
     return encoded
+
+
+_REQUEST_STOP_MARKER = encode_text("stop:")
 
 
 def decode_text(encoded: str) -> str:
@@ -238,17 +253,41 @@ def _detect_new_scratcher_from_profile(http_session: Any, username: str, headers
     return None
 
 
-def _split_cloud_value(value: Any) -> tuple[str, str] | None:
+def _split_cloud_value(value: Any, max_payload: int = SCRATCH_FRAME_DATA_LIMIT) -> tuple[str, str] | None:
     """Return (payload, seed) from a cloud value ending in .12345."""
     raw = str(value).strip()
     payload, dot, seed = raw.rpartition(".")
     if not dot or len(seed) != SEED_LENGTH or not seed.isdigit():
         return None
-    if len(payload) > 250 or len(payload) % 2 or not payload.isdigit():
+    if len(payload) > max_payload or len(payload) % 2 or not payload.isdigit():
         return None
     if not SEED_MIN <= int(seed) <= SEED_MAX:
         return None
     return payload, seed
+
+
+_INBAND_USERNAME_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+
+
+def _split_inband_username(request: str) -> tuple[str, str | None]:
+    """Split a trailing ``;username<name>;`` identity off a TurboWarp request.
+
+    TurboWarp's server broadcasts variable updates without any writer field and
+    has no activity log, so the server cannot learn who sent a request. The
+    client appends its username and a separator before the ``stop:`` marker:
+    ``get:db|key;usernamejohn;stop:``. The caller removes ``stop:`` first,
+    leaving the final semicolon here. A trailing separator is removed before
+    splitting. Because ``;`` is escaped inside fields, the identity segment is
+    unambiguous. Returns (command, name-or-None).
+    """
+    request = request[:-1] if request.endswith(";") else request
+    parts = split_escaped(request, ";")
+    if len(parts) < 2 or not parts[-1].startswith("username"):
+        return request, None
+    name = parts[-1][len("username"):]
+    if not _INBAND_USERNAME_RE.fullmatch(name):
+        return request, None
+    return ";".join(parts[:-1]), name
 
 
 @dataclass
@@ -401,7 +440,37 @@ events = _EventManager()
 class _ProjectConfig:
     project_id: str
     username: str
-    password: str
+    password: str | None = None
+    turbowarp: bool = False
+    user_agent: str | None = None
+
+    @property
+    def use_scratch(self) -> bool:
+        """Scratch's own cloud server needs a login, so it needs a password."""
+        return self.password is not None
+
+
+class _CloudLink:
+    """State for one cloud WebSocket: either Scratch's or TurboWarp's."""
+
+    def __init__(self, kind: str, host: str, username: str) -> None:
+        self.kind = kind  # "scratch" or "turbowarp"
+        self.host = host
+        self.username = username  # name sent in the handshake and in set packets
+        self.ws: Any = None
+        self.ready = threading.Event()
+        self.send_lock = threading.Lock()
+        self.receiver: threading.Thread | None = None
+        self.ignore_initial_th_snapshot = True  # Scratch only
+        self.connected_at = 0.0  # TurboWarp only
+
+    @property
+    def is_turbowarp(self) -> bool:
+        return self.kind == "turbowarp"
+
+    @property
+    def label(self) -> str:
+        return "TurboWarp" if self.is_turbowarp else "Scratch"
 
 
 class _Connection:
@@ -410,17 +479,54 @@ class _Connection:
         self._databases: list[Database] = []
         self._lock = threading.RLock()
 
-    def setup(self, _id: int | str, username: str, password: str) -> None:
+    def setup(
+        self,
+        _id: int | str,
+        username: str,
+        password: str | None = None,
+        turbowarp: bool | int | None = None,
+        user_agent: str | None = None,
+    ) -> None:
+        """Configure the project.
+
+        ``username`` is required. ``password`` and ``turbowarp`` are optional:
+
+        * password only            -> Scratch's cloud server
+        * password + turbowarp=1   -> Scratch's cloud server *and* TurboWarp's
+        * turbowarp=1, no password -> TurboWarp only
+        * neither                  -> TurboWarp only (turbowarp is assumed to be 1)
+
+        ``user_agent`` is sent to TurboWarp, which asks bots to include contact
+        information in it (for example ``"MyBot/1.0 you@example.com"``).
+        """
         if isinstance(_id, bool) or not isinstance(_id, (int, str)):
             raise TypeError("_id must be a string or integer")
         if not str(_id).strip():
             raise ValueError("_id cannot be empty")
         if not username or not isinstance(username, str):
             raise ValueError("username must be a non-empty string")
-        if not password or not isinstance(password, str):
-            raise ValueError("password must be a non-empty string")
+        if password is not None and (not isinstance(password, str) or not password):
+            raise ValueError("password must be a non-empty string when provided")
+        if user_agent is not None and (not isinstance(user_agent, str) or not user_agent.strip()):
+            raise ValueError("user_agent must be a non-empty string when provided")
+
+        if turbowarp is None:
+            # No explicit choice: without a password there is nothing to log in
+            # to Scratch with, so assume the connection is meant for TurboWarp.
+            use_turbowarp = password is None
+        elif isinstance(turbowarp, bool):
+            use_turbowarp = turbowarp
+        elif isinstance(turbowarp, int) and turbowarp in (0, 1):
+            use_turbowarp = bool(turbowarp)
+        else:
+            raise TypeError("turbowarp must be 1/0 or True/False")
+
+        if password is None and not use_turbowarp:
+            raise ValueError("password is required when turbowarp is off")
         with self._lock:
-            self._project = _ProjectConfig(str(_id), username, password)
+            self._project = _ProjectConfig(
+                str(_id), username, password, use_turbowarp, user_agent
+            )
 
     def use(self, databases: Iterable[Database] | Database) -> None:
         if isinstance(databases, Database):
@@ -454,20 +560,16 @@ class _Server:
         self._buffers: dict[str, dict[str, Any]] = {}
         self._buffer_lock = threading.RLock()
         self._response_lock = threading.Lock()
-        self._send_lock = threading.Lock()
-        self._queue: Queue[tuple[str, str] | None] = Queue()
+        self._queue: Queue[tuple[str, str, _CloudLink] | None] = Queue()
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
-        self._receiver: threading.Thread | None = None
+        self._links: list[_CloudLink] = []
         self._http: Any = None
         self._session_id: str | None = None
         self._session_token: str | None = None
         self._authenticated_username: str | None = None
         self._new_scratcher: bool | None = None
         self._cookie_header: str | None = None
-        self._ws: Any = None
-        self._connection_ready = threading.Event()
-        self._ignore_initial_th_snapshot = True
         self._last_response_seed: str | None = None
 
     def _authenticate(self) -> None:
@@ -634,8 +736,8 @@ class _Server:
             "unknown" if self._new_scratcher is None else self._new_scratcher,
         )
 
-    def _open_cloud_socket(self) -> Any:
-        """Open Scratch's real cloud WebSocket and send its project handshake."""
+    def _open_cloud_socket(self, link: _CloudLink) -> Any:
+        """Open a cloud WebSocket (Scratch's or TurboWarp's) and send its project handshake."""
         try:
             import websocket
         except ImportError as exc:
@@ -645,19 +747,24 @@ class _Server:
 
         ws = None
         try:
-            ws = websocket.create_connection(
-                "wss://clouddata.scratch.mit.edu/",
-                cookie=self._cookie_header,
-                origin="https://scratch.mit.edu",
-                timeout=5,
-                enable_multithread=True,
-            )
+            options: dict[str, Any] = {"timeout": 5, "enable_multithread": True}
+            if link.is_turbowarp:
+                # TurboWarp needs no login but requires a descriptive User-Agent.
+                user_agent = self.project.user_agent or DEFAULT_USER_AGENT
+                options["header"] = [f"User-Agent: {user_agent}"]
+            else:
+                options["cookie"] = self._cookie_header
+                options["origin"] = "https://scratch.mit.edu"
+            ws = websocket.create_connection(link.host, **options)
             handshake = {
                 "method": "handshake",
-                "user": self._authenticated_username,
+                "user": link.username,
                 "project_id": self.project.project_id,
             }
-            ws.send(json.dumps(handshake, separators=(",", ":")) + "\n")
+            ws.send(
+                json.dumps(handshake, separators=(",", ":"))
+                + ("" if link.is_turbowarp else "\n")
+            )
             ws.settimeout(1.0)
         except Exception as exc:
             if ws is not None:
@@ -665,27 +772,64 @@ class _Server:
                     ws.close()
                 except Exception:
                     pass
-            raise ScratchStoreError(f"Could not connect to Scratch's cloud WebSocket: {exc}") from exc
+            hint = ""
+            if link.is_turbowarp:
+                hint = (
+                    " (TurboWarp rejects connections whose User-Agent lacks contact "
+                    "information; pass user_agent=... to connection.setup())"
+                )
+            raise ScratchStoreError(
+                f"Could not connect to {link.label}'s cloud WebSocket: {exc}{hint}"
+            ) from exc
 
-        self._ws = ws
-        self._connection_ready.set()
-        self._ignore_initial_th_snapshot = True
-        LOG.info("Connected to Scratch clouddata for project %s", self.project.project_id)
+        link.ws = ws
+        link.connected_at = time.monotonic()
+        link.ignore_initial_th_snapshot = True
+        link.ready.set()
+        LOG.info("Connected to %s clouddata for project %s", link.label, self.project.project_id)
         return ws
 
     def connect(self) -> None:
-        self._authenticate()
-        self._open_cloud_socket()
+        if self.project.use_scratch:
+            self._authenticate()
+            self._links.append(
+                _CloudLink("scratch", SCRATCH_CLOUD_HOST, str(self._authenticated_username))
+            )
+        if self.project.turbowarp:
+            if not self.project.user_agent:
+                LOG.warning(
+                    "No user_agent was given to connection.setup(); TurboWarp asks bots to "
+                    "include contact information in their User-Agent and may block this one."
+                )
+            self._links.append(
+                _CloudLink("turbowarp", TURBOWARP_CLOUD_HOST, self.project.username)
+            )
+
+        for link in self._links:
+            try:
+                self._open_cloud_socket(link)
+            except ScratchStoreError as exc:
+                if len(self._links) == 1 or not self.automatic:
+                    self.stop()
+                    raise
+                # With two links, keep the working one running; this link's
+                # receiver thread retries until it connects.
+                LOG.error("%s; will keep retrying in the background", exc)
+
         self._worker = threading.Thread(
             target=self._worker_loop, name="ScratchStore-worker", daemon=True
         )
-        self._receiver = threading.Thread(
-            target=self._receiver_loop, name="ScratchStore-cloud-receiver", daemon=True
-        )
         self._worker.start()
-        self._receiver.start()
+        for link in self._links:
+            link.receiver = threading.Thread(
+                target=self._receiver_loop,
+                args=(link,),
+                name=f"ScratchStore-{link.kind}-receiver",
+                daemon=True,
+            )
+            link.receiver.start()
 
-    def _receiver_loop(self) -> None:
+    def _receiver_loop(self, link: _CloudLink) -> None:
         """Read newline-delimited cloud events and reconnect if the socket drops."""
         try:
             import websocket
@@ -693,7 +837,7 @@ class _Server:
             return
 
         while not self._stop_event.is_set():
-            ws = self._ws
+            ws = link.ws
             if ws is None:
                 if not self.automatic:
                     self._stop_event.set()
@@ -701,15 +845,15 @@ class _Server:
                 if self._stop_event.wait(0.5):
                     break
                 try:
-                    self._open_cloud_socket()
+                    self._open_cloud_socket(link)
                 except Exception as reconnect_error:
-                    LOG.error("Scratch cloud reconnect failed: %s", reconnect_error)
+                    LOG.error("%s cloud reconnect failed: %s", link.label, reconnect_error)
                     self._stop_event.wait(3.0)
                 continue
             try:
                 message = ws.recv()
                 if message is None or message == "":
-                    raise ConnectionError("Scratch cloud WebSocket closed")
+                    raise ConnectionError(f"{link.label} cloud WebSocket closed")
                 for raw_line in str(message).splitlines():
                     if not raw_line.strip():
                         continue
@@ -719,33 +863,33 @@ class _Server:
                         LOG.debug("Ignoring non-JSON cloud frame: %r", raw_line[:160])
                         continue
                     if isinstance(packet, dict):
-                        self._handle_cloud_packet(packet)
+                        self._handle_cloud_packet(link, packet)
             except websocket.WebSocketTimeoutException:
                 continue
             except Exception as exc:
                 if self._stop_event.is_set():
                     break
-                self._connection_ready.clear()
+                link.ready.clear()
                 try:
                     ws.close()
                 except Exception:
                     pass
-                if self._ws is ws:
-                    self._ws = None
+                if link.ws is ws:
+                    link.ws = None
 
                 if not self.automatic:
-                    LOG.error("Scratch cloud socket disconnected; automatic reconnect is disabled")
+                    LOG.error("%s cloud socket disconnected; automatic reconnect is disabled", link.label)
                     self._stop_event.set()
                     break
 
-                LOG.warning("Scratch cloud socket disconnected (%s); reconnecting", exc)
+                LOG.warning("%s cloud socket disconnected (%s); reconnecting", link.label, exc)
                 self._stop_event.wait(1.0)
                 if self._stop_event.is_set():
                     break
                 try:
-                    self._open_cloud_socket()
+                    self._open_cloud_socket(link)
                 except Exception as reconnect_error:
-                    LOG.error("Scratch cloud reconnect failed: %s", reconnect_error)
+                    LOG.error("%s cloud reconnect failed: %s", link.label, reconnect_error)
                     self._stop_event.wait(3.0)
 
     def _lookup_log_username(self, variable_name: str, value: str) -> str | None:
@@ -786,7 +930,7 @@ class _Server:
                 time.sleep(0.12)
         return None
 
-    def _handle_cloud_packet(self, packet: dict[str, Any]) -> None:
+    def _handle_cloud_packet(self, link: _CloudLink, packet: dict[str, Any]) -> None:
         if packet.get("method") != "set":
             return
         variable = str(packet.get("name", "")).removeprefix("☁ ")
@@ -794,50 +938,71 @@ class _Server:
             return
         value = str(packet.get("value", ""))
 
-        # The handshake sends the project's current variable values as an
-        # initial snapshot. Do not mistake the old TH value for a new request.
-        if self._ignore_initial_th_snapshot:
-            self._ignore_initial_th_snapshot = False
+        if link.is_turbowarp:
+            # TurboWarp replays stored values right after the handshake (and
+            # replays nothing for a new room), so ignore by time, not by count.
+            if time.monotonic() - link.connected_at < TURBOWARP_SNAPSHOT_GRACE_SECONDS:
+                LOG.debug("Ignoring a TH packet received during the TurboWarp join snapshot")
+                return
+        elif link.ignore_initial_th_snapshot:
+            # The handshake sends the project's current variable values as an
+            # initial snapshot. Do not mistake the old TH value for a new request.
+            link.ignore_initial_th_snapshot = False
             LOG.debug("Ignoring the initial TH cloud-variable snapshot")
             return
 
-        username = packet.get("user") or packet.get("username")
-        if not username:
-            username = self._lookup_log_username(variable, value)
-        if not username:
-            LOG.warning("Could not resolve the Scratch username for a TH update; ignoring it")
-            return
+        username: Any = None
+        if not link.is_turbowarp:
+            username = packet.get("user") or packet.get("username")
+            if not username:
+                username = self._lookup_log_username(variable, value)
+            if not username:
+                LOG.warning("Could not resolve the Scratch username for a TH update; ignoring it")
+                return
+        # On TurboWarp the writer is unknown until the whole request has been
+        # assembled (see _split_inband_username), so all TurboWarp chunks share
+        # one buffer.
 
-        parsed = _split_cloud_value(value)
+        parsed = _split_cloud_value(value, TURBOWARP_FRAME_DATA_LIMIT if link.is_turbowarp else SCRATCH_FRAME_DATA_LIMIT)
         if parsed is None:
-            LOG.debug("Ignoring malformed TH packet from %s", username)
+            LOG.debug("Ignoring malformed TH packet from %s", username or "a TurboWarp client")
             return
         payload, seed = parsed
         now = time.monotonic()
         completed: str | None = None
         with self._buffer_lock:
-            username_key = str(username).lower()
+            username_key = "\0turbowarp" if link.is_turbowarp else str(username).lower()
             buffer = self._buffers.get(username_key)
             if buffer is None or now - buffer["updated"] > 8.0:
-                buffer = {"parts": [], "seeds": set(), "updated": now}
+                buffer = {"parts": [], "seeds": set(), "updated": now, "tail": ""}
                 self._buffers[username_key] = buffer
             if seed in buffer["seeds"]:
                 return
             buffer["seeds"].add(seed)
             buffer["parts"].append(payload)
+            buffer["tail"] = (buffer["tail"] + payload)[-len(_REQUEST_STOP_MARKER):]
             buffer["updated"] = now
-            encoded = "".join(buffer["parts"])
-            try:
-                decoded = decode_text(encoded)
-            except ProtocolError:
-                LOG.warning("Discarding malformed request stream from %s", username)
-                self._buffers.pop(username_key, None)
-                return
-            if decoded.endswith("stop:"):
+            if buffer["tail"] == _REQUEST_STOP_MARKER:
+                encoded = "".join(buffer["parts"])
+                try:
+                    decoded = decode_text(encoded)
+                except ProtocolError:
+                    LOG.warning("Discarding malformed request stream from %s", username or "a TurboWarp client")
+                    self._buffers.pop(username_key, None)
+                    return
                 completed = decoded[:-5]
                 self._buffers.pop(username_key, None)
         if completed is not None:
-            self._queue.put((str(username), completed))
+            if link.is_turbowarp:
+                completed, username = _split_inband_username(completed)
+                if username is None:
+                    LOG.warning(
+                        "Ignoring a TurboWarp request that does not say who sent it. TurboWarp "
+                        "does not reveal the sender, so the client must end each request with "
+                        "';username<name>;stop:'."
+                    )
+                    return
+            self._queue.put((str(username), completed, link))
 
     def _worker_loop(self) -> None:
         """Process completed client requests and send their responses.
@@ -856,9 +1021,9 @@ class _Server:
                 if item is None:
                     return
 
-                username, command = item
+                username, command, link = item
                 try:
-                    response = self._execute(command, username=username)
+                    response = self._execute(command, username=username, is_turbowarp=link.is_turbowarp)
                 except ProtocolError as exc:
                     LOG.warning("Invalid request from %s: %s", username, exc)
                     response = "error:bad_request"
@@ -872,42 +1037,49 @@ class _Server:
                     response = "error:internal"
 
                 try:
-                    self._send_response(response, username)
+                    self._send_response(response, username, link)
                 except Exception:
                     LOG.exception("Could not send the response to %s", username)
             finally:
                 self._queue.task_done()
 
-    def _send_cloud_values(self, values: dict[str, str]) -> None:
-        """Send multiple cloud-variable set packets over our own WebSocket."""
+    def _send_cloud_values(self, link: _CloudLink, values: dict[str, str]) -> None:
+        """Send multiple cloud-variable set packets over one link's WebSocket."""
         packets = []
         for variable, value in values.items():
             value = str(value)
-            if len(value) > CLOUD_VALUE_LIMIT or not value.replace(".", "").replace("-", "").isnumeric():
-                raise ProtocolError(f"Invalid Scratch cloud value for {variable!r}")
+            value_limit = TURBOWARP_CLOUD_VALUE_LIMIT if link.is_turbowarp else SCRATCH_CLOUD_VALUE_LIMIT
+            if len(value) > value_limit or not value.replace(".", "").replace("-", "").isnumeric():
+                raise ProtocolError(f"Invalid {link.label} cloud value for {variable!r}")
             packets.append({
                 "method": "set",
-                "user": self._authenticated_username,
+                "user": link.username,
                 "project_id": self.project.project_id,
                 "name": variable if variable.startswith("☁ ") else f"☁ {variable}",
                 "value": value,
             })
-        payload = "".join(json.dumps(packet, separators=(",", ":"), ensure_ascii=False) + "\n" for packet in packets)
-        if not self._connection_ready.wait(timeout=10):
-            raise ScratchStoreError("Scratch cloud WebSocket is not connected")
-        with self._send_lock:
-            ws = self._ws
+        lines = [json.dumps(packet, separators=(",", ":"), ensure_ascii=False) + "\n" for packet in packets]
+        if not link.ready.wait(timeout=10):
+            raise ScratchStoreError(f"{link.label} cloud WebSocket is not connected")
+        with link.send_lock:
+            ws = link.ws
             if ws is None:
-                raise ScratchStoreError("Scratch cloud WebSocket disconnected before send")
+                raise ScratchStoreError(f"{link.label} cloud WebSocket disconnected before send")
             try:
-                # One WebSocket frame can carry several newline-delimited JSON
-                # cloud packets; this keeps an FH page together.
-                ws.send(payload)
+                if link.is_turbowarp:
+                    # TurboWarp's documentation only describes newline-batched
+                    # messages for server -> client, so send one packet per frame.
+                    for line in lines:
+                        ws.send(line)
+                else:
+                    # One WebSocket frame can carry several newline-delimited JSON
+                    # cloud packets; this keeps an FH page together.
+                    ws.send("".join(lines))
             except Exception as exc:
-                self._connection_ready.clear()
+                link.ready.clear()
                 raise ScratchStoreError(f"Could not send cloud-variable updates: {exc}") from exc
 
-    def _execute(self, command: str, username: str = "unknown") -> str:
+    def _execute(self, command: str, username: str = "unknown", *, is_turbowarp: bool = False) -> str:
         head = split_escaped(command, ":", maxsplit=1)
         if len(head) != 2:
             raise ProtocolError("Request is missing its command separator.")
@@ -929,6 +1101,10 @@ class _Server:
             if len(fields) != 3:
                 raise ProtocolError("set requires database, key, and value")
             database = self._get_database(fields[0])
+            if not is_turbowarp and len(fields[2]) > SCRATCH_VALUE_LENGTH_LIMIT:
+                raise ProtocolError(
+                    f"Scratch values cannot exceed {SCRATCH_VALUE_LENGTH_LIMIT} characters."
+                )
             LOG.info(
                 "Set operation from %s: database=%s key=%s",
                 actor, database.name, fields[1].lower(),
@@ -987,7 +1163,7 @@ class _Server:
             raise ProtocolError(f"Unknown database {name!r}")
         return database
 
-    def _send_response(self, body: str, username: str) -> None:
+    def _send_response(self, body: str, username: str, link: _CloudLink) -> None:
         # Keep the two username fields separate: the first belongs to the data
         # response, while stop;username is the end-of-stream marker.
         # Scratch usernames can contain uppercase letters, but the wire alphabet
@@ -995,7 +1171,9 @@ class _Server:
         username = str(username).lower()
         response_text = f"{str(body).lower()};username{username}stop;{username}"
         encoded = encode_text(response_text)
-        chunks = [encoded[i:i + FRAME_DATA_LIMIT] for i in range(0, len(encoded), FRAME_DATA_LIMIT)]
+        frame_data_limit = TURBOWARP_FRAME_DATA_LIMIT if link.is_turbowarp else SCRATCH_FRAME_DATA_LIMIT
+        page_character_capacity = (frame_data_limit // 2) * RESPONSE_PAGE_LANES
+        chunks = [encoded[i:i + frame_data_limit] for i in range(0, len(encoded), frame_data_limit)]
         if not chunks:
             chunks = [""]
 
@@ -1015,20 +1193,21 @@ class _Server:
                     # Only write populated lanes; later FH variables retain
                     # their previous values and are ignored by the client.
                     value = f"{payload}.{seed}"
-                    if len(value) > CLOUD_VALUE_LIMIT:
-                        raise AssertionError("A cloud value exceeded Scratch's 256-character limit")
+                    value_limit = TURBOWARP_CLOUD_VALUE_LIMIT if link.is_turbowarp else SCRATCH_CLOUD_VALUE_LIMIT
+                    if len(value) > value_limit:
+                        raise AssertionError(f"A cloud value exceeded {link.label} limit of {value_limit} characters")
                     values[lane_name] = value
-                self._send_cloud_values(values)
-                # Nine 250-digit lanes carry 1,125 decoded characters per page.
-                # Wait exactly one second only when another FH_1..FH_9 page
+                self._send_cloud_values(link, values)
+                # Nine lanes carry one page; lane size depends on the cloud server.
+                # Wait 0.6 seconds only when another FH_1..FH_9 page
                 # remains to be sent; the final page is not followed by this delay.
                 has_another_page = page_start + RESPONSE_PAGE_LANES < len(chunks)
                 if has_another_page:
-                    assert len(response_text) > RESPONSE_PAGE_CHARACTER_CAPACITY
+                    assert len(encoded) > page_character_capacity
                     time.sleep(RESPONSE_PAGE_DELAY_SECONDS)
             # Leave the final response visible briefly before the next queued
             # request overwrites the shared FH variables.
-            time.sleep(1)
+            time.sleep(RESPONSE_PAGE_DELAY_SECONDS)
 
     def run_forever(self) -> None:
         self.connect()
@@ -1047,15 +1226,17 @@ class _Server:
             self._queue.put_nowait(None)
         except Exception:
             pass
-        self._connection_ready.clear()
-        ws = self._ws
-        self._ws = None
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception:
-                pass
-        for thread in (self._receiver, self._worker):
+        for link in self._links:
+            link.ready.clear()
+            ws = link.ws
+            link.ws = None
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+        threads = [link.receiver for link in self._links] + [self._worker]
+        for thread in threads:
             if thread is not None and thread.is_alive() and thread is not threading.current_thread():
                 thread.join(timeout=2.0)
         if self._http is not None:
@@ -1081,7 +1262,9 @@ def start(verbose: bool = False, automatic: bool = True) -> None:
 
     Args:
         verbose: Enable informational server logs when true.
-        automatic: Reconnect to the cloud WebSocket after disconnects when true.
+        automatic: Reconnect to the cloud WebSocket(s) after disconnects when
+            true. This covers TurboWarp's server too when turbowarp is on in
+            ``connection.setup()``.
     """
     global _active_server
     if not isinstance(verbose, bool):
